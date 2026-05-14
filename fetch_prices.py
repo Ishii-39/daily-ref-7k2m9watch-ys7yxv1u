@@ -44,6 +44,16 @@ def fetch_one(symbol: str) -> dict | None:
             base = float(closes.iloc[-1 - n])
             return ((last - base) / base) * 100 if base else None
 
+        # Market cap from fast_info (faster than .info)
+        market_cap = None
+        try:
+            fi = tk.fast_info
+            mc = fi.get("market_cap") or fi.get("marketCap")
+            if mc:
+                market_cap = float(mc)
+        except Exception:
+            pass
+
         return {
             "symbol": symbol,
             "last": last,
@@ -53,11 +63,11 @@ def fetch_one(symbol: str) -> dict | None:
             "chg_5d": pct_n_days_ago(5),
             "chg_1mo": pct_n_days_ago(20),
             "volume": int(vols.iloc[-1]) if not vols.empty else 0,
-            "high_52w": float(closes.max()),  # 注: 2ヶ月のため簡易。fetch_52w で精度向上
+            "high_52w": float(closes.max()),
             "low_52w": float(closes.min()),
             "date": closes.index[-1].strftime("%Y-%m-%d"),
-            # tick_time: 直近の引け時刻 (Unix秒)。JS側でタイムゾーン表示に使う
             "tick_time": int(closes.index[-1].timestamp()),
+            "market_cap": market_cap,
         }
     except Exception as e:
         print(f"[WARN] {symbol}: {e}", file=sys.stderr)
@@ -93,8 +103,44 @@ def detect_market(symbol: str) -> tuple[str, str]:
     return "US", "$"
 
 
+def fetch_fx_rates() -> dict[str, float]:
+    """各通貨→USD のレートを取得。失敗時は1.0でフォールバック。"""
+    # yfinance のシンボル: USDJPY=X は "1USD = N JPY"。逆算で 1JPY = 1/N USD。
+    pairs = {
+        "JPY": "JPY=X",   # USDJPY → 1JPY = 1/rate USD
+        "KRW": "KRW=X",
+        "CNY": "CNY=X",
+        "HKD": "HKD=X",
+        "TWD": "TWD=X",
+    }
+    fx = {"USD": 1.0}
+    for ccy, sym in pairs.items():
+        try:
+            tk = yf.Ticker(sym)
+            hist = tk.history(period="5d", auto_adjust=False)
+            if hist is not None and not hist.empty:
+                rate = float(hist["Close"].dropna().iloc[-1])
+                if rate > 0:
+                    fx[ccy] = 1.0 / rate
+                    continue
+        except Exception:
+            pass
+        # フォールバック値（おおよそ）
+        fallback = {"JPY": 1/150, "KRW": 1/1370, "CNY": 1/7.2, "HKD": 1/7.8, "TWD": 1/32}
+        fx[ccy] = fallback.get(ccy, 1.0)
+    return fx
+
+
+# 通貨マッピング
+MARKET_TO_CCY = {"JP": "JPY", "KR": "KRW", "CN": "CNY", "HK": "HKD", "TW": "TWD", "US": "USD"}
+
+
 def main() -> int:
     tickers = json.loads(TICKERS_FILE.read_text(encoding="utf-8"))
+    print("[INFO] Fetching FX rates...")
+    fx = fetch_fx_rates()
+    print(f"[INFO] FX rates (per USD): " + ", ".join(f"{k}={v:.6f}" for k, v in fx.items()))
+
     rows: list[dict] = []
 
     for entry in tickers:
@@ -103,16 +149,27 @@ def main() -> int:
         if data is None:
             print(f"[SKIP] {sym}")
             continue
-        # 52週レンジを上書き（精度向上）
         yr = fetch_52w(sym)
         if yr:
             data["high_52w"], data["low_52w"] = yr
         market, currency = detect_market(sym)
         data["name"] = entry["name"]
-        data["sector"] = entry.get("sector", "")
+        # New schema: sectors is array, fallback to legacy single "sector" string for backwards compat
+        sectors = entry.get("sectors")
+        if sectors is None and "sector" in entry:
+            sectors = [entry["sector"]]
+        data["sectors"] = sectors or []
+        data["note"] = entry.get("note", "")
         data["market"] = market
         data["currency"] = currency
-        # 52週レンジ内の位置（%）
+        ccy = MARKET_TO_CCY.get(market, "USD")
+        # Market cap → USD換算
+        mc = data.get("market_cap")
+        if mc:
+            data["market_cap_usd"] = mc * fx.get(ccy, 1.0)
+        else:
+            data["market_cap_usd"] = None
+        # 52週レンジ内位置
         if data["high_52w"] > data["low_52w"]:
             data["range_pos"] = (
                 (data["last"] - data["low_52w"])
@@ -157,7 +214,7 @@ TEMPLATE = r"""<!doctype html>
 <meta name="referrer" content="no-referrer">
 <!-- ページを5分毎に自動リロード。GHA cronが裏で更新するため、開きっぱなしで最新化される -->
 <meta http-equiv="refresh" content="300">
-<title>Daily Watchlist</title>
+<title>AI &amp; Semiconductor Watchlist</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -281,6 +338,7 @@ TEMPLATE = r"""<!doctype html>
   .stat .val {
     font: 500 22px "IBM Plex Serif", serif;
     color: var(--ink);
+    line-height: 1.25;
   }
   .stat .val.up { color: var(--up); }
   .stat .val.down { color: var(--down); }
@@ -397,6 +455,282 @@ TEMPLATE = r"""<!doctype html>
     height: 8px;
     background: var(--accent);
     left: calc(var(--p, 50%) - 1px);
+  }
+
+  /* Sector chips */
+  .chips {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    max-width: 100%;
+  }
+  .chip {
+    display: inline-block;
+    padding: 2px 7px;
+    background: var(--rule-soft);
+    color: var(--ink-soft);
+    font: 500 10px/1.4 "IBM Plex Sans", sans-serif;
+    letter-spacing: 0.02em;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .chip.active {
+    background: var(--accent);
+    color: var(--bg);
+  }
+  /* Sector filter pills above table - collapsed by default */
+  .sector-bar {
+    margin: 10px 0 14px;
+    padding: 10px 12px;
+    background: var(--bg-panel);
+    border: 1px solid var(--rule);
+  }
+  .sector-bar .toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .sector-bar .toggle-btn {
+    background: transparent;
+    border: 0;
+    color: var(--ink);
+    font: 500 11px "IBM Plex Sans", sans-serif;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    padding: 4px 8px 4px 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .sector-bar .toggle-btn .arrow {
+    display: inline-block;
+    transition: transform 0.15s;
+    font-size: 9px;
+    color: var(--ink-faint);
+  }
+  .sector-bar .toggle-btn.open .arrow { transform: rotate(180deg); }
+  .sector-bar .active-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px 4px 10px;
+    background: var(--accent);
+    color: var(--bg);
+    font: 500 11px "IBM Plex Sans", sans-serif;
+    border-radius: 2px;
+  }
+  .sector-bar .active-chip .close {
+    cursor: pointer;
+    font-weight: 500;
+    opacity: 0.8;
+    margin-left: 4px;
+  }
+  .sector-bar .active-chip .close:hover { opacity: 1; }
+  .sector-bar .panel {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--rule-soft);
+  }
+  .sector-bar .panel.hidden { display: none; }
+  .sector-bar .chip {
+    cursor: pointer;
+    padding: 4px 9px;
+    font-size: 11px;
+  }
+  .sector-bar .chip:hover { background: var(--rule); }
+
+  /* Add chip button in table cells */
+  .add-chip {
+    display: inline-block;
+    padding: 2px 6px;
+    background: transparent;
+    border: 1px dashed var(--ink-faint);
+    color: var(--ink-faint);
+    font: 500 10px/1.4 "IBM Plex Sans", sans-serif;
+    border-radius: 2px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .add-chip:hover {
+    border-color: var(--ink);
+    color: var(--ink);
+  }
+  .chip-remove {
+    cursor: pointer;
+    margin-left: 4px;
+    opacity: 0.5;
+    font-size: 9px;
+  }
+  .chip-remove:hover { opacity: 1; }
+
+  td.sectors-cell { max-width: 240px; }
+  td.mcap { font: 500 12px "IBM Plex Mono", monospace; }
+
+  /* Note column - now editable */
+  td.note-cell {
+    font-family: "IBM Plex Sans", sans-serif;
+    font-size: 12px;
+    color: var(--ink-soft);
+    font-style: italic;
+    max-width: 240px;
+    cursor: text;
+  }
+  td.note-cell:hover {
+    background: rgba(31, 58, 95, 0.04);
+  }
+  td.note-cell .note-display {
+    display: inline-block;
+    min-height: 16px;
+    min-width: 80px;
+    padding: 2px 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 220px;
+  }
+  td.note-cell .note-display:empty::before {
+    content: "click to add note";
+    color: var(--ink-faint);
+    font-style: normal;
+    font-size: 11px;
+  }
+  td.note-cell input.note-input {
+    width: 220px;
+    padding: 4px 6px;
+    border: 1px solid var(--accent);
+    background: var(--bg);
+    font: 400 12px "IBM Plex Sans", sans-serif;
+    color: var(--ink);
+    outline: none;
+  }
+
+  /* Save bar fixed at bottom when there are unsaved edits */
+  .save-bar {
+    position: sticky;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--ink);
+    color: var(--bg);
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    border-top: 2px solid var(--accent);
+    z-index: 100;
+    box-shadow: 0 -4px 10px rgba(0,0,0,0.1);
+  }
+  .save-bar .msg {
+    flex: 1;
+    font: 500 13px "IBM Plex Sans", sans-serif;
+  }
+  .save-bar .msg .count {
+    background: var(--accent);
+    padding: 2px 8px;
+    border-radius: 2px;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px;
+    margin-right: 6px;
+  }
+  .save-bar button {
+    padding: 7px 16px;
+    background: var(--bg);
+    color: var(--ink);
+    border: 0;
+    cursor: pointer;
+    font: 500 12px/1 "IBM Plex Sans", sans-serif;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .save-bar button:hover { background: var(--bg-panel); }
+  .save-bar button.secondary {
+    background: transparent;
+    color: var(--bg);
+    border: 1px solid rgba(247,245,239,0.3);
+  }
+  .save-bar button.secondary:hover { background: rgba(247,245,239,0.1); }
+
+  /* Modal for add-sector */
+  .modal-backdrop {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+  }
+  .modal-backdrop.hidden { display: none; }
+  .modal {
+    background: var(--bg);
+    border: 1px solid var(--ink);
+    padding: 24px;
+    width: 360px;
+    max-width: 90vw;
+  }
+  .modal h3 {
+    margin: 0 0 4px;
+    font: 500 16px "IBM Plex Serif", serif;
+  }
+  .modal .target {
+    font: 400 12px "IBM Plex Mono", monospace;
+    color: var(--ink-soft);
+    margin-bottom: 14px;
+  }
+  .modal label {
+    font: 500 10px/1 "IBM Plex Mono", monospace;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    display: block;
+    margin-bottom: 6px;
+  }
+  .modal input[type="text"] {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--rule);
+    background: var(--bg);
+    font: 400 13px "IBM Plex Sans", sans-serif;
+    color: var(--ink);
+    outline: none;
+    box-sizing: border-box;
+  }
+  .modal input[type="text"]:focus { border-color: var(--accent); }
+  .modal .existing {
+    margin-top: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .modal .existing .chip {
+    cursor: pointer;
+    padding: 3px 8px;
+  }
+  .modal .actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 18px;
+    justify-content: flex-end;
+  }
+  .modal .actions button {
+    padding: 7px 14px;
+    font: 500 11px "IBM Plex Sans", sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    border: 1px solid var(--ink);
+  }
+  .modal .actions button.primary {
+    background: var(--ink);
+    color: var(--bg);
+  }
+  .modal .actions button.secondary {
+    background: transparent;
+    color: var(--ink);
   }
 
   .sort-bar {
@@ -571,9 +905,12 @@ TEMPLATE = r"""<!doctype html>
     .mkt-card:nth-child(n+4) { border-top: 1px solid var(--rule); }
     .stat:nth-child(2) { border-right: 0; }
     .stat:nth-child(1), .stat:nth-child(2) { border-bottom: 1px solid var(--rule); }
-    td.sector, th.col-sector { display: none; }
     td.range-cell, th.col-range { display: none; }
     td.chg1mo, th.col-1mo { display: none; }
+    td.col-vol, th.col-vol { display: none; }
+    td.col-mcap, th.col-mcap { display: none; }
+    td.note-cell, th.col-note { display: none; }
+    td.sectors-cell, th.col-sectors { max-width: 120px; }
     .brand h1 { font-size: 24px; }
   }
 </style>
@@ -582,7 +919,7 @@ TEMPLATE = r"""<!doctype html>
 <div class="wrap">
   <header>
     <div class="brand">
-      <h1>Daily Watchlist</h1>
+      <h1>AI &amp; Semiconductor Watchlist</h1>
       <div class="sub">Global tech &amp; semi · server-side snapshot · sorted by day-over-day</div>
     </div>
     <div class="meta">
@@ -608,11 +945,14 @@ TEMPLATE = r"""<!doctype html>
       <button class="qbtn" data-sort="chg_pct">Day %</button>
       <button class="qbtn" data-sort="chg_5d">5D %</button>
       <button class="qbtn" data-sort="chg_1mo">1M %</button>
+      <button class="qbtn" data-sort="market_cap_usd">Mkt Cap</button>
       <button class="qbtn" data-sort="volume">Volume</button>
       <button class="qbtn" data-sort="symbol">Symbol</button>
     </div>
     <span style="margin-left:auto">Active: <span class="current" id="sortLabel"></span></span>
   </div>
+
+  <div class="sector-bar" id="sectorBar"></div>
 
   <div id="tableMount"></div>
 
@@ -622,12 +962,36 @@ TEMPLATE = r"""<!doctype html>
   </footer>
 </div>
 
+<div class="save-bar" id="saveBar" style="display:none">
+  <div class="msg"><span class="count" id="editCount">0</span>件の未保存の編集があります</div>
+  <button class="secondary" id="discardBtn">破棄</button>
+  <button id="saveBtn">GitHubに保存</button>
+</div>
+
+<div class="modal-backdrop hidden" id="sectorModal">
+  <div class="modal">
+    <h3>セクターラベルを追加</h3>
+    <div class="target" id="modalTarget"></div>
+    <label for="newSectorInput">新しいラベル</label>
+    <input type="text" id="newSectorInput" placeholder="例: AI Core, Watching, 2024Q4..." autocomplete="off">
+    <label style="margin-top:14px">既存のラベルから選ぶ</label>
+    <div class="existing" id="modalExisting"></div>
+    <div class="actions">
+      <button class="secondary" id="modalCancel">キャンセル</button>
+      <button class="primary" id="modalAdd">追加</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const DATA = /*__DATA__*/;
 let filter = "all";
 let query = "";
 let sortKey = "chg_pct";
 let sortDir = -1; // -1 desc, 1 asc
+let sectorFilter = null; // active sector chip; null = no filter
+let sectorBarExpanded = false; // collapsed by default
+let editedTickers = null; // ユーザー編集状態 ({symbol -> {sectors, note}})、未編集なら null
 
 // === Market timezone + hours (local) ===
 const MARKET_INFO = {
@@ -653,6 +1017,14 @@ const fmtVol = (n) => {
   if (n >= 1e6) return (n/1e6).toFixed(2) + "M";
   if (n >= 1e3) return (n/1e3).toFixed(1) + "K";
   return n.toString();
+};
+// Market cap formatter: returns native + USD pair for tooltip display
+const fmtMcap = (n) => {
+  if (!n) return "—";
+  if (n >= 1e12) return (n/1e12).toFixed(2) + "T";
+  if (n >= 1e9)  return (n/1e9).toFixed(2) + "B";
+  if (n >= 1e6)  return (n/1e6).toFixed(0) + "M";
+  return n.toFixed(0);
 };
 const cls = (p) => p == null ? "flat" : p > 0.005 ? "up" : p < -0.005 ? "down" : "flat";
 const sign = (p) => p == null ? "" : p > 0 ? "+" : "";
@@ -741,12 +1113,14 @@ function renderMarketStatus() {
 function rowsFiltered() {
   let rs = DATA.slice();
   if (filter !== "all") rs = rs.filter(r => r.market === filter);
+  if (sectorFilter) rs = rs.filter(r => getSectors(r.symbol).includes(sectorFilter));
   if (query) {
     const q = query.toLowerCase();
     rs = rs.filter(r =>
       r.symbol.toLowerCase().includes(q) ||
       r.name.toLowerCase().includes(q) ||
-      (r.sector || "").toLowerCase().includes(q)
+      getSectors(r.symbol).some(s => s.toLowerCase().includes(q)) ||
+      getNote(r.symbol).toLowerCase().includes(q)
     );
   }
   rs.sort((a, b) => {
@@ -779,14 +1153,14 @@ function renderSummary() {
     </div>
     <div class="stat">
       <div class="label">Top mover</div>
-      <div class="val ${cls(top?.chg_pct)}" title="${top?.name||''}">
-        ${top ? top.symbol + ' ' + sign(top.chg_pct) + fmtNum(top.chg_pct,2) + '%' : '—'}
+      <div class="val ${cls(top?.chg_pct)}" title="${top?.symbol||''}">
+        ${top ? `<span style="font-size:14px;font-weight:500">${top.name}</span><br><span style="font-size:18px">${sign(top.chg_pct)}${fmtNum(top.chg_pct,2)}%</span>` : '—'}
       </div>
     </div>
     <div class="stat">
       <div class="label">Worst</div>
-      <div class="val ${cls(bot?.chg_pct)}" title="${bot?.name||''}">
-        ${bot ? bot.symbol + ' ' + sign(bot.chg_pct) + fmtNum(bot.chg_pct,2) + '%' : '—'}
+      <div class="val ${cls(bot?.chg_pct)}" title="${bot?.symbol||''}">
+        ${bot ? `<span style="font-size:14px;font-weight:500">${bot.name}</span><br><span style="font-size:18px">${sign(bot.chg_pct)}${fmtNum(bot.chg_pct,2)}%</span>` : '—'}
       </div>
     </div>
   `;
@@ -797,14 +1171,16 @@ function renderTable() {
   const cols = [
     { k: "symbol",  label: "Symbol",  left: true },
     { k: "name",    label: "Name",    left: true },
-    { k: "sector",  label: "Sector",  left: true, extraClass: "col-sector" },
     { k: "market",  label: "Mkt",     left: true },
     { k: "last",    label: "Last" },
     { k: "chg_pct", label: "Day %" },
     { k: "chg_5d",  label: "5D %" },
     { k: "chg_1mo", label: "1M %",   extraClass: "col-1mo" },
-    { k: "volume",  label: "Volume" },
-    { k: "range_pos", label: "52W Range", extraClass: "col-range" },
+    { k: "market_cap_usd", label: "Mkt Cap", extraClass: "col-mcap" },
+    { k: "volume",  label: "Volume", extraClass: "col-vol" },
+    { k: "range_pos", label: "52W", extraClass: "col-range" },
+    { k: "_sectors", label: "Sectors", left: true, extraClass: "col-sectors", sortable: false },
+    { k: "note", label: "Note", left: true, extraClass: "col-note", sortable: false },
   ];
 
   const colLabel = cols.find(c => c.k === sortKey)?.label || sortKey;
@@ -821,7 +1197,9 @@ function renderTable() {
 
   const thead = `<thead><tr>${cols.map(c => {
     const sortCls = c.k === sortKey ? (sortDir < 0 ? "sort-desc" : "sort-asc") : "";
-    return `<th class="${c.left ? 'left' : ''} ${c.extraClass||''} ${sortCls}" data-k="${c.k}">${c.label}<span class="arrow">▼</span></th>`;
+    const dataK = c.sortable === false ? "" : `data-k="${c.k}"`;
+    const cursor = c.sortable === false ? ' style="cursor: default"' : "";
+    return `<th class="${c.left ? 'left' : ''} ${c.extraClass||''} ${sortCls}" ${dataK}${cursor}>${c.label}${c.sortable === false ? '' : '<span class="arrow">▼</span>'}</th>`;
   }).join("")}</tr></thead>`;
 
   const tbody = `<tbody>${rs.map(r => {
@@ -829,23 +1207,44 @@ function renderTable() {
     const tickLocal = tsAt(r.tick_time, MARKET_INFO[r.market]?.tz);
     const tickJst = tsAt(r.tick_time, "Asia/Tokyo");
     const tooltip = `Last tick: ${tickLocal} ${MARKET_INFO[r.market]?.label || ''} (${tickJst} JST)`;
+    // Market cap display: native currency primary, USD in tooltip
+    let mcapDisp = "—", mcapTip = "";
+    if (r.market_cap) {
+      mcapDisp = r.currency + fmtMcap(r.market_cap);
+      if (r.market_cap_usd) {
+        mcapTip = `≈ $${fmtMcap(r.market_cap_usd)} USD`;
+      }
+    }
+    // Use edited state for sectors and note
+    const sectors = getSectors(r.symbol);
+    const noteText = getNote(r.symbol);
+    const sectorsHtml = `<div class="chips">
+      ${sectors.map(s => {
+        const active = s === sectorFilter ? " active" : "";
+        return `<span class="chip${active}" data-sector="${escapeHtml(s)}" data-sym="${r.symbol}">${escapeHtml(s)}<span class="chip-remove" data-remove="1" data-sym="${r.symbol}" data-s="${escapeHtml(s)}">×</span></span>`;
+      }).join("")}
+      <span class="add-chip" data-add-sym="${r.symbol}">+ add</span>
+    </div>`;
     return `
     <tr class="${trCls}">
       <td class="left sym">${r.symbol}</td>
-      <td class="left name" title="${r.name}">${r.name}</td>
-      <td class="left sector col-sector">${r.sector || ''}</td>
+      <td class="left name" title="${escapeHtml(r.name)}">${escapeHtml(r.name)}</td>
       <td class="left market">${r.market}</td>
       <td title="${tooltip}">${fmtPrice(r.last, r.currency)}</td>
       <td><span class="pct ${cls(r.chg_pct)}">${sign(r.chg_pct)}${fmtNum(r.chg_pct,2)}%</span></td>
       <td class="pct-soft ${cls(r.chg_5d)}">${sign(r.chg_5d)}${fmtNum(r.chg_5d,1)}%</td>
       <td class="pct-soft ${cls(r.chg_1mo)} chg1mo">${sign(r.chg_1mo)}${fmtNum(r.chg_1mo,1)}%</td>
+      <td class="mcap" title="${mcapTip}">${mcapDisp}</td>
       <td>${fmtVol(r.volume)}</td>
       <td class="range-cell"><div class="range" style="--p:${(r.range_pos||50).toFixed(0)}%" title="${fmtNum(r.range_pos,0)}% of 52w range"></div></td>
+      <td class="left sectors-cell">${sectorsHtml}</td>
+      <td class="left note-cell" data-sym="${r.symbol}"><span class="note-display">${escapeHtml(noteText)}</span></td>
     </tr>`;
   }).join("")}</tbody>`;
 
   document.getElementById("tableMount").innerHTML = `<table>${thead}${tbody}</table>`;
 
+  // Sortable column headers
   document.querySelectorAll("th[data-k]").forEach(th => {
     th.addEventListener("click", () => {
       const k = th.dataset.k;
@@ -853,9 +1252,165 @@ function renderTable() {
       renderTable();
     });
   });
+  // Sector chip click: filter by sector (but not on remove button)
+  document.querySelectorAll("td.sectors-cell .chip").forEach(chip => {
+    chip.addEventListener("click", (e) => {
+      if (e.target.closest(".chip-remove")) return;
+      const s = chip.dataset.sector;
+      sectorFilter = (sectorFilter === s) ? null : s;
+      renderSectorBar();
+      rerender();
+    });
+  });
+  // Remove chip click (×)
+  document.querySelectorAll(".chip-remove").forEach(rm => {
+    rm.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const sym = rm.dataset.sym;
+      const s = rm.dataset.s;
+      const current = getSectors(sym);
+      setSectors(sym, current.filter(x => x !== s));
+      rerender();
+    });
+  });
+  // Add chip click → open modal
+  document.querySelectorAll(".add-chip").forEach(btn => {
+    btn.addEventListener("click", () => openSectorModal(btn.dataset.addSym));
+  });
+  // Note cell click → enter edit mode
+  document.querySelectorAll("td.note-cell").forEach(cell => {
+    cell.addEventListener("click", (e) => {
+      if (cell.querySelector("input")) return;
+      const sym = cell.dataset.sym;
+      const current = getNote(sym);
+      cell.innerHTML = `<input type="text" class="note-input" maxlength="200" value="${escapeHtml(current)}" placeholder="メモを入力...">`;
+      const input = cell.querySelector("input");
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+      const commit = () => {
+        const newVal = input.value;
+        if (newVal !== current) setNote(sym, newVal);
+        cell.innerHTML = `<span class="note-display">${escapeHtml(newVal)}</span>`;
+      };
+      input.addEventListener("blur", commit);
+      input.addEventListener("keydown", (ke) => {
+        if (ke.key === "Enter") { ke.preventDefault(); input.blur(); }
+        if (ke.key === "Escape") { input.value = current; input.blur(); }
+      });
+    });
+  });
+}
+
+// HTML escape helper
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
 }
 
 function rerender() { renderSummary(); renderTable(); }
+
+// Render the sector filter bar above the table (collapsed by default)
+function renderSectorBar() {
+  // Aggregate all unique sectors with counts (using edited state if available)
+  const counts = new Map();
+  for (const r of DATA) {
+    const sectors = getSectors(r.symbol);
+    for (const s of sectors) {
+      counts.set(s, (counts.get(s) || 0) + 1);
+    }
+  }
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+
+  const toggleClass = sectorBarExpanded ? "open" : "";
+  const panelClass = sectorBarExpanded ? "" : "hidden";
+
+  const html = `
+    <div class="toggle-row">
+      <button class="toggle-btn ${toggleClass}" id="sectorToggle">
+        Filter by sector <span class="arrow">▼</span>
+      </button>
+      ${sectorFilter ? `
+        <span class="active-chip">
+          ${escapeHtml(sectorFilter)}
+          <span class="close" id="clearActiveChip">×</span>
+        </span>
+      ` : ''}
+      <span style="margin-left:auto;font:500 10px/1 'IBM Plex Mono',monospace;color:var(--ink-faint);letter-spacing:0.06em;text-transform:uppercase">${sorted.length} sectors / ${DATA.length} tickers</span>
+    </div>
+    <div class="panel ${panelClass}" id="sectorPanel">
+      ${sorted.map(([s, n]) => {
+        const active = s === sectorFilter ? " active" : "";
+        return `<span class="chip${active}" data-sector="${escapeHtml(s)}">${escapeHtml(s)} <span style="opacity:0.6;font-size:9px">${n}</span></span>`;
+      }).join("")}
+    </div>
+  `;
+  document.getElementById("sectorBar").innerHTML = html;
+
+  // Toggle expansion
+  document.getElementById("sectorToggle").addEventListener("click", () => {
+    sectorBarExpanded = !sectorBarExpanded;
+    renderSectorBar();
+  });
+  // Chip click → set as filter
+  document.querySelectorAll("#sectorBar .panel .chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      const s = chip.dataset.sector;
+      sectorFilter = (sectorFilter === s) ? null : s;
+      renderSectorBar();
+      rerender();
+    });
+  });
+  // Active chip close button
+  const close = document.getElementById("clearActiveChip");
+  if (close) close.addEventListener("click", () => {
+    sectorFilter = null;
+    renderSectorBar();
+    rerender();
+  });
+}
+
+// Edit helpers - retrieve current state for a ticker (edited > original)
+function getSectors(symbol) {
+  if (editedTickers && editedTickers[symbol] && editedTickers[symbol].sectors !== undefined) {
+    return editedTickers[symbol].sectors;
+  }
+  const row = DATA.find(r => r.symbol === symbol);
+  return row?.sectors || [];
+}
+function getNote(symbol) {
+  if (editedTickers && editedTickers[symbol] && editedTickers[symbol].note !== undefined) {
+    return editedTickers[symbol].note;
+  }
+  const row = DATA.find(r => r.symbol === symbol);
+  return row?.note || "";
+}
+function setSectors(symbol, sectors) {
+  editedTickers = editedTickers || {};
+  editedTickers[symbol] = editedTickers[symbol] || {};
+  editedTickers[symbol].sectors = sectors;
+  renderSaveBar();
+}
+function setNote(symbol, note) {
+  editedTickers = editedTickers || {};
+  editedTickers[symbol] = editedTickers[symbol] || {};
+  editedTickers[symbol].note = note;
+  renderSaveBar();
+}
+function editCount() {
+  if (!editedTickers) return 0;
+  return Object.keys(editedTickers).length;
+}
+function renderSaveBar() {
+  const bar = document.getElementById("saveBar");
+  const n = editCount();
+  if (n === 0) {
+    bar.style.display = "none";
+  } else {
+    bar.style.display = "flex";
+    document.getElementById("editCount").textContent = n;
+  }
+}
 
 function renderTabs() {
   const order = ["all", "US", "JP", "TW", "KR", "CN", "HK"];
@@ -888,12 +1443,156 @@ document.querySelectorAll(".qbtn").forEach(b => {
   });
 });
 
+// === Sector add modal ===
+let modalCurrentSym = null;
+function openSectorModal(symbol) {
+  modalCurrentSym = symbol;
+  const row = DATA.find(r => r.symbol === symbol);
+  document.getElementById("modalTarget").textContent = `${row.name} (${symbol})`;
+  document.getElementById("newSectorInput").value = "";
+  // Build list of existing sectors not yet on this ticker
+  const allSectors = new Set();
+  for (const r of DATA) for (const s of getSectors(r.symbol)) allSectors.add(s);
+  const currentSectors = new Set(getSectors(symbol));
+  const available = [...allSectors].filter(s => !currentSectors.has(s)).sort();
+  document.getElementById("modalExisting").innerHTML = available.length
+    ? available.map(s => `<span class="chip" data-pick="${escapeHtml(s)}">${escapeHtml(s)}</span>`).join("")
+    : '<span style="color:var(--ink-faint);font-size:11px;font-style:italic">既存ラベルなし</span>';
+  document.querySelectorAll("#modalExisting .chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      addSectorToCurrent(chip.dataset.pick);
+    });
+  });
+  document.getElementById("sectorModal").classList.remove("hidden");
+  setTimeout(() => document.getElementById("newSectorInput").focus(), 50);
+}
+function addSectorToCurrent(label) {
+  if (!modalCurrentSym || !label) return;
+  label = label.trim();
+  if (!label) return;
+  const current = getSectors(modalCurrentSym);
+  if (current.includes(label)) {
+    closeSectorModal();
+    return;
+  }
+  setSectors(modalCurrentSym, [...current, label]);
+  closeSectorModal();
+  rerender();
+  renderSectorBar();
+}
+function closeSectorModal() {
+  document.getElementById("sectorModal").classList.add("hidden");
+  modalCurrentSym = null;
+}
+
+// === Save: serialize edits and copy/open GitHub ===
+function buildUpdatedJson() {
+  // Reconstruct tickers.json structure with edits applied
+  const result = DATA.map(r => ({
+    symbol: r.symbol,
+    name: r.name,
+    sectors: getSectors(r.symbol),
+    note: getNote(r.symbol),
+  }));
+  return JSON.stringify(result, null, 2);
+}
+function saveToGitHub() {
+  const json = buildUpdatedJson();
+  // GitHub repo URL detection: assume the page is hosted at <user>.github.io/<repo>/
+  const host = location.host; // e.g. "ishii-39.github.io"
+  const pathParts = location.pathname.split("/").filter(Boolean);
+  let editUrl = "https://github.com/";
+  if (host.endsWith(".github.io") && pathParts.length > 0) {
+    const user = host.split(".")[0];
+    const repo = pathParts[0];
+    editUrl = `https://github.com/${user}/${repo}/edit/main/tickers.json`;
+  } else {
+    editUrl = "https://github.com";
+  }
+  // Copy to clipboard
+  copyToClipboard(json).then(() => {
+    showToast("✓ tickers.json の内容をクリップボードにコピーしました。新タブで GitHub の編集画面が開きます。\n\n1) 全選択 (Cmd+A) → 2) ペースト (Cmd+V) → 3) 下にスクロール → 4) Commit changes");
+    window.open(editUrl, "_blank");
+  }).catch(() => {
+    // Fallback: show JSON in a prompt
+    const ta = document.createElement("textarea");
+    ta.value = json;
+    ta.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:80vw;height:60vh;z-index:300;padding:12px;font-family:monospace;font-size:11px;background:white;border:2px solid black";
+    document.body.appendChild(ta);
+    ta.select();
+    showToast("コピーできなかった場合: 表示されたテキストエリアの内容を手動でコピーして GitHub に貼り付けてください。");
+  });
+}
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.cssText = "position:fixed;top:-1000px";
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      resolve();
+    } catch (e) {
+      document.body.removeChild(ta);
+      reject(e);
+    }
+  });
+}
+function showToast(msg) {
+  const t = document.createElement("div");
+  t.textContent = msg;
+  t.style.cssText = "position:fixed;top:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:12px 18px;font:500 12px/1.5 'IBM Plex Sans',sans-serif;max-width:80vw;z-index:300;white-space:pre-line;box-shadow:0 4px 14px rgba(0,0,0,0.25)";
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 6000);
+}
+function discardEdits() {
+  if (!confirm("未保存の編集を全て破棄します。よろしいですか？")) return;
+  editedTickers = null;
+  renderSaveBar();
+  rerender();
+  renderSectorBar();
+}
+
 // === Boot ===
 renderTabs();
 rerender();
+renderSectorBar();
 renderMarketStatus();
 // Re-render market status banner every minute so Open/Closed labels stay current
 setInterval(renderMarketStatus, 60_000);
+
+// Modal events
+document.getElementById("modalCancel").addEventListener("click", closeSectorModal);
+document.getElementById("modalAdd").addEventListener("click", () => {
+  const val = document.getElementById("newSectorInput").value.trim();
+  if (val) addSectorToCurrent(val);
+});
+document.getElementById("newSectorInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    const val = e.target.value.trim();
+    if (val) addSectorToCurrent(val);
+  }
+  if (e.key === "Escape") closeSectorModal();
+});
+document.getElementById("sectorModal").addEventListener("click", (e) => {
+  if (e.target.id === "sectorModal") closeSectorModal();
+});
+// Save bar events
+document.getElementById("saveBtn").addEventListener("click", saveToGitHub);
+document.getElementById("discardBtn").addEventListener("click", discardEdits);
+// Warn on navigation if unsaved edits
+window.addEventListener("beforeunload", (e) => {
+  if (editCount() > 0) {
+    e.preventDefault();
+    e.returnValue = "";
+  }
+});
 </script>
 </body>
 </html>
