@@ -67,6 +67,7 @@ def fetch_one(symbol: str) -> dict | None:
                 pass
 
         # 日次履歴 (5D/1M リターン + 52週レンジ算出用)
+        # auto_adjust=False で「未調整値」を取得 → 業務でよく見る生の終値
         hist = tk.history(period="2mo", auto_adjust=False)
         if hist is None or hist.empty or len(hist) < 2:
             return None
@@ -74,16 +75,22 @@ def fetch_one(symbol: str) -> dict | None:
         closes = hist["Close"].dropna()
         vols = hist["Volume"].dropna()
 
-        # last/prev は fast_info を優先 (最新の取引値が反映されるため)
-        # fast_info から取れない場合は履歴の最終2行から
+        # last は fast_info を優先 (最新の取引値が反映されるため)
+        # fast_info から取れない場合は履歴の最終行から
         if fast_last is not None and fast_last > 0:
             last = float(fast_last)
         else:
             last = float(closes.iloc[-1])
-        if fast_prev is not None and fast_prev > 0:
-            prev = float(fast_prev)
-        else:
+
+        # prev は履歴の「未調整終値」を必ず使用 (fast_info.previous_close は配当落ち調整される
+        # ことがあり、業務で見る前日比とズレるため)
+        # last が履歴の最終値と同じ場合 → 履歴の最後から2番目を prev に
+        # last が履歴の最終値と違う場合 (fast_info の方が新しい) → 履歴の最終値を prev に
+        last_close = float(closes.iloc[-1])
+        if abs(last - last_close) < 0.01 * last_close:  # 同じ値とみなせる場合
             prev = float(closes.iloc[-2])
+        else:
+            prev = last_close
 
         chg = last - prev
         chg_pct = (chg / prev) * 100 if prev else 0.0
