@@ -1,0 +1,55 @@
+name: Update daily watchlist
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'fetch_prices.py'
+      - 'tickers.json'
+      - 'requirements.txt'
+      - '.github/workflows/update.yml'
+
+  schedule:
+    - cron: "*/15 0-8 * * 1-5"
+    - cron: "*/15 13-21 * * 1-5"
+    - cron: "5 21 * * 1-5"
+
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-watchlist
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch prices and generate HTML
+        run: python fetch_prices.py
+
+      - name: Commit updated index.html
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ -n "$(git status --porcelain index.html)" ]]; then
+            git add index.html
+            git commit -m "chore: update watchlist $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          else
+            echo "No changes to commit."
+          fi
