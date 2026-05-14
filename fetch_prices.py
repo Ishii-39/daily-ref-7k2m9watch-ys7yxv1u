@@ -23,36 +23,88 @@ JST = timezone(timedelta(hours=9))
 
 
 def fetch_one(symbol: str) -> dict | None:
-    """1銘柄分の価格情報を取得して dict で返す。失敗時は None。"""
+    """1銘柄分の価格情報を取得して dict で返す。失敗時は None。
+    
+    戦略:
+    - tk.fast_info から「現在価格 (last_price)」「前日終値 (previous_close)」を優先取得
+      → これにより yfinance が「今日の値動き」を正しく反映できる
+    - tk.history() は 5D/1M リターン算出と 52週レンジのみに使う
+    """
     try:
         tk = yf.Ticker(symbol)
-        # 約2ヶ月分の日次データを取得（前日比、5日、1ヶ月 %算出のため）
+
+        # fast_info: 最新の last_price と previous_close (引け前/引け後問わず最新)
+        fast_last = None
+        fast_prev = None
+        market_cap = None
+        pe_ratio = None
+        high_52w_fast = None
+        low_52w_fast = None
+        try:
+            fi = tk.fast_info
+            fast_last = fi.get("last_price") or fi.get("lastPrice")
+            fast_prev = fi.get("previous_close") or fi.get("previousClose")
+            mc = fi.get("market_cap") or fi.get("marketCap")
+            if mc:
+                market_cap = float(mc)
+            pe = fi.get("trailing_pe") or fi.get("trailingPE")
+            if pe is not None and pe > 0 and pe < 10000:
+                pe_ratio = float(pe)
+            high_52w_fast = fi.get("year_high") or fi.get("yearHigh")
+            low_52w_fast = fi.get("year_low") or fi.get("yearLow")
+        except Exception:
+            pass
+
+        # PER の fallback: fast_info にない場合は .info
+        if pe_ratio is None:
+            try:
+                info = tk.info
+                if info and isinstance(info, dict):
+                    pe = info.get("trailingPE") or info.get("forwardPE")
+                    if pe is not None and pe > 0 and pe < 10000:
+                        pe_ratio = float(pe)
+            except Exception:
+                pass
+
+        # 日次履歴 (5D/1M リターン + 52週レンジ算出用)
         hist = tk.history(period="2mo", auto_adjust=False)
         if hist is None or hist.empty or len(hist) < 2:
             return None
 
         closes = hist["Close"].dropna()
         vols = hist["Volume"].dropna()
-        last = float(closes.iloc[-1])
-        prev = float(closes.iloc[-2])
+
+        # last/prev は fast_info を優先 (最新の取引値が反映されるため)
+        # fast_info から取れない場合は履歴の最終2行から
+        if fast_last is not None and fast_last > 0:
+            last = float(fast_last)
+        else:
+            last = float(closes.iloc[-1])
+        if fast_prev is not None and fast_prev > 0:
+            prev = float(fast_prev)
+        else:
+            prev = float(closes.iloc[-2])
+
         chg = last - prev
         chg_pct = (chg / prev) * 100 if prev else 0.0
 
+        # 5D / 1M リターンは履歴ベース (last は fast_info の最新値を使用)
         def pct_n_days_ago(n: int) -> float | None:
             if len(closes) <= n:
                 return None
             base = float(closes.iloc[-1 - n])
             return ((last - base) / base) * 100 if base else None
 
-        # Market cap from fast_info (faster than .info)
-        market_cap = None
-        try:
-            fi = tk.fast_info
-            mc = fi.get("market_cap") or fi.get("marketCap")
-            if mc:
-                market_cap = float(mc)
-        except Exception:
-            pass
+        # 52週高安: fast_info を優先、なければ履歴の最大/最小
+        high_52w = float(high_52w_fast) if high_52w_fast else float(closes.max())
+        low_52w = float(low_52w_fast) if low_52w_fast else float(closes.min())
+
+        # tick_time: fast_info の場合は現時点、履歴フォールバック時は引け時刻
+        if fast_last is not None and fast_last > 0:
+            from datetime import datetime as _dt
+            tick_time = int(_dt.now().timestamp())
+        else:
+            tick_time = int(closes.index[-1].timestamp())
 
         return {
             "symbol": symbol,
@@ -63,11 +115,12 @@ def fetch_one(symbol: str) -> dict | None:
             "chg_5d": pct_n_days_ago(5),
             "chg_1mo": pct_n_days_ago(20),
             "volume": int(vols.iloc[-1]) if not vols.empty else 0,
-            "high_52w": float(closes.max()),
-            "low_52w": float(closes.min()),
+            "high_52w": high_52w,
+            "low_52w": low_52w,
             "date": closes.index[-1].strftime("%Y-%m-%d"),
-            "tick_time": int(closes.index[-1].timestamp()),
+            "tick_time": tick_time,
             "market_cap": market_cap,
+            "pe_ratio": pe_ratio,
         }
     except Exception as e:
         print(f"[WARN] {symbol}: {e}", file=sys.stderr)
@@ -101,6 +154,65 @@ def detect_market(symbol: str) -> tuple[str, str]:
     if s.endswith(".TW") or s.endswith(".TWO"):
         return "TW", "NT$"
     return "US", "$"
+
+
+# ============================================================
+# 市場セッション判定: 「ザラ場中(値が変動する状態)ではない」ことを確認
+# True = 取得安全 (週末 / 開場前 / 引け30分後以降)
+# False = ザラ場中 (値が不安定なため前回値を保持)
+# ============================================================
+# (tz_offset_hours, open_h, open_m, close_h, close_m)
+MARKET_SCHEDULE = {
+    "JP": (9,  9, 0,  15, 30),  # 9:00-15:30 JST
+    "KR": (9,  9, 0,  15, 30),  # 9:00-15:30 KST
+    "TW": (8,  9, 0,  13, 30),  # 9:00-13:30 TWT
+    "HK": (8,  9, 30, 16, 0),   # 9:30-16:00 HKT
+    "CN": (8,  9, 30, 15, 0),   # 9:30-15:00 CST
+    "US": (-5, 9, 30, 16, 0),   # 9:30-16:00 ET (EST, 夏時間は実質-4だが許容)
+}
+
+
+def is_safe_to_fetch(market: str) -> bool:
+    """指定市場について「今取得して安定した確定値が取れるか」を判定。
+    取得安全 = 市場がザラ場中ではない（週末 / 開場前 / 引け+30分以降）
+    取得不安全 = ザラ場中 → 値が変動するので取得しない
+    """
+    from datetime import datetime, timezone, timedelta
+    if market not in MARKET_SCHEDULE:
+        return True
+    tz_off, oh, om, ch, cm = MARKET_SCHEDULE[market]
+    tz = timezone(timedelta(hours=tz_off))
+    now_local = datetime.now(timezone.utc).astimezone(tz)
+    # 週末は土日 → 取得可 (金曜の確定値を取れる)
+    if now_local.weekday() >= 5:
+        return True
+    today_open = now_local.replace(hour=oh, minute=om, second=0, microsecond=0)
+    today_close = now_local.replace(hour=ch, minute=cm, second=0, microsecond=0)
+    close_plus_buffer = today_close + timedelta(minutes=30)
+    # 開場前 OR 引け30分後以降 → 安全
+    return now_local < today_open or now_local >= close_plus_buffer
+
+
+def load_previous_data() -> dict[str, dict]:
+    """前回 commit された index.html から銘柄データを抽出 (差分更新用)。
+    market_close=False のときに前回の値を保持するため。"""
+    if not OUTPUT_FILE.exists():
+        return {}
+    try:
+        html = OUTPUT_FILE.read_text(encoding="utf-8")
+        # JSON データ部を取り出す
+        import re
+        m = re.search(
+            r'<script id="__data__"[^>]*>(.*?)</script>',
+            html, re.DOTALL
+        )
+        if not m:
+            return {}
+        rows = json.loads(m.group(1))
+        return {r["symbol"]: r for r in rows}
+    except Exception as e:
+        print(f"[WARN] 前回データの読み込み失敗: {e}", file=sys.stderr)
+        return {}
 
 
 def fetch_fx_rates() -> dict[str, float]:
@@ -141,20 +253,71 @@ def main() -> int:
     fx = fetch_fx_rates()
     print(f"[INFO] FX rates (per USD): " + ", ".join(f"{k}={v:.6f}" for k, v in fx.items()))
 
+    # 前回データを読み込む (市場が開いている間は前回の確定値を保持する)
+    prev_data = load_previous_data()
+    print(f"[INFO] Previous data loaded: {len(prev_data)} tickers")
+
+    # 各市場の取得可否をログ出力
+    market_safe = {m: is_safe_to_fetch(m) for m in MARKET_SCHEDULE}
+    print(f"[INFO] Safe to fetch (no active session): " + ", ".join(
+        f"{m}={'YES' if c else 'NO'}" for m, c in market_safe.items()
+    ))
+
     rows: list[dict] = []
+    fetched_count = 0
+    kept_count = 0
 
     for entry in tickers:
         sym = entry["symbol"]
+        market, currency = detect_market(sym)
+
+        # ザラ場中の市場 → 取得しない、前回値を保持
+        if not market_safe.get(market, True):
+            if sym in prev_data:
+                # 前回データを保持 (セクター・メモは tickers.json から最新を反映)
+                row = dict(prev_data[sym])
+                # セクター/メモは tickers.json で更新される可能性があるため上書き
+                sectors = entry.get("sectors")
+                if sectors is None and "sector" in entry:
+                    sectors = [entry["sector"]]
+                row["sectors"] = sectors or []
+                row["note"] = entry.get("note", "")
+                row["name"] = entry["name"]  # 表示名も追従
+                # FX レートだけは最新で再換算 (USD表示の精度向上)
+                ccy = MARKET_TO_CCY.get(market, "USD")
+                mc = row.get("market_cap")
+                if mc:
+                    row["market_cap_usd"] = mc * fx.get(ccy, 1.0)
+                rows.append(row)
+                kept_count += 1
+                continue
+            else:
+                # 前回データがない場合のみ取得を試みる (初回 push 時など)
+                print(f"[INFO] {sym}: market open but no prev data, will fetch")
+
+        # 市場が閉場している、または初回 → 取得
         data = fetch_one(sym)
         if data is None:
-            print(f"[SKIP] {sym}")
+            # 取得失敗時は前回データを保持
+            if sym in prev_data:
+                row = dict(prev_data[sym])
+                sectors = entry.get("sectors")
+                if sectors is None and "sector" in entry:
+                    sectors = [entry["sector"]]
+                row["sectors"] = sectors or []
+                row["note"] = entry.get("note", "")
+                row["name"] = entry["name"]
+                rows.append(row)
+                kept_count += 1
+                print(f"[KEEP] {sym}: fetch failed, kept previous data")
+            else:
+                print(f"[SKIP] {sym}: fetch failed, no prev data")
             continue
+
         yr = fetch_52w(sym)
         if yr:
             data["high_52w"], data["low_52w"] = yr
-        market, currency = detect_market(sym)
         data["name"] = entry["name"]
-        # New schema: sectors is array, fallback to legacy single "sector" string for backwards compat
         sectors = entry.get("sectors")
         if sectors is None and "sector" in entry:
             sectors = [entry["sector"]]
@@ -163,13 +326,11 @@ def main() -> int:
         data["market"] = market
         data["currency"] = currency
         ccy = MARKET_TO_CCY.get(market, "USD")
-        # Market cap → USD換算
         mc = data.get("market_cap")
         if mc:
             data["market_cap_usd"] = mc * fx.get(ccy, 1.0)
         else:
             data["market_cap_usd"] = None
-        # 52週レンジ内位置
         if data["high_52w"] > data["low_52w"]:
             data["range_pos"] = (
                 (data["last"] - data["low_52w"])
@@ -179,23 +340,54 @@ def main() -> int:
         else:
             data["range_pos"] = 50.0
         rows.append(data)
+        fetched_count += 1
 
     if not rows:
         print("[ERROR] データ取得失敗。HTMLは更新しません。", file=sys.stderr)
         return 1
 
+    print(f"[INFO] {fetched_count} fetched / {kept_count} kept from previous / {len(rows)} total")
     updated_at = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
-    html = render_html(rows, updated_at)
+    html = render_html(rows, updated_at, fx)
     OUTPUT_FILE.write_text(html, encoding="utf-8")
     print(f"[OK] {len(rows)} 銘柄 / 出力: {OUTPUT_FILE}")
     return 0
 
 
-def render_html(rows: list[dict], updated_at: str) -> str:
+def _sanitize(v):
+    """JSON-safe な値に変換。NaN/Infinity は None に。"""
+    import math
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return None
+    return v
+
+
+def _clean_row(row: dict) -> dict:
+    """全フィールドを JSON-safe にクリーン化。"""
+    return {k: _sanitize(v) for k, v in row.items()}
+
+
+def render_html(rows: list[dict], updated_at: str, fx: dict[str, float] = None) -> str:
     """ダッシュボードHTMLを生成。データはJSONとして埋め込み、JSでテーブル描画。"""
-    data_json = json.dumps(rows, ensure_ascii=False)
-    return TEMPLATE.replace("/*__DATA__*/", data_json).replace(
-        "__UPDATED__", updated_at
+    # NaN/Infinity を None に変換してから JSON 化（JS パース時のエラー防止）
+    # default=str は使わない（数値型まで文字列化されて JS で計算エラーになるため）
+    clean_rows = [_clean_row(r) for r in rows]
+    data_json = json.dumps(clean_rows, ensure_ascii=False, allow_nan=False)
+    # </script> 文字列がデータに混入していた場合の防御
+    data_json = data_json.replace("</", "<\\/")
+    # Build FX rate display string for footer (1 USD = N XXX format)
+    fx_str = ""
+    if fx:
+        order = ["JPY", "KRW", "CNY", "HKD", "TWD"]
+        fmt = lambda v: f"{1/v:,.2f}" if v and v > 0 else "—"
+        parts = [f"1 USD = {fmt(fx.get(c))} {c}" for c in order if c in fx]
+        fx_str = " · ".join(parts)
+    return (
+        TEMPLATE
+        .replace("/*__DATA__*/", data_json)
+        .replace("__UPDATED__", updated_at)
+        .replace("__FX_RATES__", fx_str)
     )
 
 
@@ -896,22 +1088,151 @@ TEMPLATE = r"""<!doctype html>
     letter-spacing: 0.04em;
   }
   footer a { color: var(--ink-soft); }
+  footer .fx-rates {
+    margin-top: 6px;
+    font-size: 10px;
+    color: var(--ink-faint);
+    opacity: 0.75;
+    letter-spacing: 0.02em;
+  }
+
+  /* Mobile card layout (replaces table on small screens) */
+  .mobile-cards { display: none; }
+  .mcard {
+    background: var(--bg-panel);
+    border: 1px solid var(--rule);
+    margin-bottom: 8px;
+    padding: 12px;
+  }
+  .mcard.top-mover { border-left: 3px solid var(--up); }
+  .mcard.worst-mover { border-left: 3px solid var(--down); }
+  .mcard-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .mcard-name {
+    font: 500 15px/1.3 "IBM Plex Sans", sans-serif;
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+  .mcard-sym {
+    font: 500 11px "IBM Plex Mono", monospace;
+    color: var(--accent);
+    margin-top: 2px;
+  }
+  .mcard-mkt {
+    font-size: 9px;
+    color: var(--ink-faint);
+    letter-spacing: 0.08em;
+    margin-left: 5px;
+  }
+  .mcard-pct {
+    text-align: right;
+    flex-shrink: 0;
+  }
+  .mcard-pct .pct-big {
+    font: 500 20px "IBM Plex Mono", monospace;
+    line-height: 1;
+  }
+  .mcard-pct .pct-big.up { color: var(--up); }
+  .mcard-pct .pct-big.down { color: var(--down); }
+  .mcard-pct .pct-big.flat { color: var(--flat); }
+  .mcard-pct .price {
+    font: 400 11px "IBM Plex Mono", monospace;
+    color: var(--ink-soft);
+    margin-top: 4px;
+  }
+  .mcard-meta {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    margin-bottom: 8px;
+    padding: 8px 0;
+    border-top: 1px solid var(--rule-soft);
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .mcard-meta .mc {
+    text-align: center;
+  }
+  .mcard-meta .mc-label {
+    font: 500 9px "IBM Plex Mono", monospace;
+    color: var(--ink-faint);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 2px;
+  }
+  .mcard-meta .mc-val {
+    font: 500 12px "IBM Plex Mono", monospace;
+    color: var(--ink);
+  }
+  .mcard-meta .mc-val.up { color: var(--up); }
+  .mcard-meta .mc-val.down { color: var(--down); }
+  .mcard-sectors {
+    margin: 6px 0;
+  }
+  .mcard-note {
+    font: 400 12px/1.4 "IBM Plex Sans", sans-serif;
+    color: var(--ink-soft);
+    font-style: italic;
+    padding: 6px 0 0;
+    border-top: 1px dashed var(--rule-soft);
+    margin-top: 4px;
+    min-height: 22px;
+    cursor: pointer;
+  }
+  .mcard-note:empty::before, .mcard-note.empty::before {
+    content: "📝 メモを追加…";
+    color: var(--ink-faint);
+    font-style: normal;
+    font-size: 11px;
+  }
+  .mcard-note input {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    font: inherit;
+    color: var(--ink);
+    padding: 2px 0;
+    outline: 1px solid var(--accent);
+  }
 
   @media (max-width: 800px) {
-    .wrap { padding: 24px 16px 48px; }
+    .wrap { padding: 16px 12px 40px; }
     .summary { grid-template-columns: repeat(2, 1fr); }
-    .markets { grid-template-columns: repeat(3, 1fr); }
+    .markets { grid-template-columns: repeat(3, 1fr); gap: 0; }
+    .mkt-card { padding: 8px 10px; }
     .mkt-card:nth-child(3n) { border-right: 0; }
     .mkt-card:nth-child(n+4) { border-top: 1px solid var(--rule); }
+    .stat { padding: 10px 12px; }
     .stat:nth-child(2) { border-right: 0; }
     .stat:nth-child(1), .stat:nth-child(2) { border-bottom: 1px solid var(--rule); }
-    td.range-cell, th.col-range { display: none; }
-    td.chg1mo, th.col-1mo { display: none; }
-    td.col-vol, th.col-vol { display: none; }
-    td.col-mcap, th.col-mcap { display: none; }
-    td.note-cell, th.col-note { display: none; }
-    td.sectors-cell, th.col-sectors { max-width: 120px; }
-    .brand h1 { font-size: 24px; }
+    .brand h1 { font-size: 22px; }
+    .brand .sub { font-size: 12px; }
+    header { flex-direction: column; align-items: flex-start; gap: 8px; }
+    .meta { text-align: left; }
+    /* Hide desktop table, show mobile cards */
+    #tableMount table { display: none; }
+    .mobile-cards { display: block; }
+    /* Compact controls */
+    .controls { flex-direction: column; align-items: stretch; gap: 8px; }
+    .tabs { width: 100%; justify-content: space-between; }
+    .tab { padding: 8px 6px; flex: 1; text-align: center; font-size: 10px; }
+    .sort-bar { flex-wrap: wrap; }
+    .sort-bar .quick { width: 100%; overflow-x: auto; flex-wrap: nowrap; }
+    .sort-bar .qbtn { white-space: nowrap; flex-shrink: 0; }
+    .sort-bar > span:last-child { width: 100%; }
+    /* Save bar mobile */
+    .save-bar { left: 12px; right: 12px; bottom: 12px; }
+    .save-bar .msg { font-size: 12px; }
+    /* Modal full-width on mobile */
+    .modal { max-width: calc(100vw - 24px); }
   }
 </style>
 </head>
@@ -945,7 +1266,8 @@ TEMPLATE = r"""<!doctype html>
       <button class="qbtn" data-sort="chg_pct">Day %</button>
       <button class="qbtn" data-sort="chg_5d">5D %</button>
       <button class="qbtn" data-sort="chg_1mo">1M %</button>
-      <button class="qbtn" data-sort="market_cap_usd">Mkt Cap</button>
+      <button class="qbtn" data-sort="market_cap_usd">Mkt Cap ($)</button>
+      <button class="qbtn" data-sort="pe_ratio">PER</button>
       <button class="qbtn" data-sort="volume">Volume</button>
       <button class="qbtn" data-sort="symbol">Symbol</button>
     </div>
@@ -955,10 +1277,12 @@ TEMPLATE = r"""<!doctype html>
   <div class="sector-bar" id="sectorBar"></div>
 
   <div id="tableMount"></div>
+  <div class="mobile-cards" id="mobileCards"></div>
 
   <footer>
-    Source: Yahoo Finance via yfinance. Prices may be delayed 15–20 minutes.
-    Auto-generated daily by GitHub Actions. For research only, not investment advice.
+    <div>Source: Yahoo Finance via yfinance. Prices may be delayed 15–20 minutes.
+    Auto-generated by GitHub Actions. For research only, not investment advice.</div>
+    <div class="fx-rates">FX (USD basis): __FX_RATES__</div>
   </footer>
 </div>
 
@@ -983,8 +1307,9 @@ TEMPLATE = r"""<!doctype html>
   </div>
 </div>
 
+<script id="__data__" type="application/json">/*__DATA__*/</script>
 <script>
-const DATA = /*__DATA__*/;
+const DATA = JSON.parse(document.getElementById("__data__").textContent);
 let filter = "all";
 let query = "";
 let sortKey = "chg_pct";
@@ -1176,7 +1501,8 @@ function renderTable() {
     { k: "chg_pct", label: "Day %" },
     { k: "chg_5d",  label: "5D %" },
     { k: "chg_1mo", label: "1M %",   extraClass: "col-1mo" },
-    { k: "market_cap_usd", label: "Mkt Cap", extraClass: "col-mcap" },
+    { k: "market_cap_usd", label: "Mkt Cap (USD)", extraClass: "col-mcap" },
+    { k: "pe_ratio", label: "PER", extraClass: "col-per" },
     { k: "volume",  label: "Volume", extraClass: "col-vol" },
     { k: "range_pos", label: "52W", extraClass: "col-range" },
     { k: "_sectors", label: "Sectors", left: true, extraClass: "col-sectors", sortable: false },
@@ -1207,12 +1533,12 @@ function renderTable() {
     const tickLocal = tsAt(r.tick_time, MARKET_INFO[r.market]?.tz);
     const tickJst = tsAt(r.tick_time, "Asia/Tokyo");
     const tooltip = `Last tick: ${tickLocal} ${MARKET_INFO[r.market]?.label || ''} (${tickJst} JST)`;
-    // Market cap display: native currency primary, USD in tooltip
+    // Market cap display: USD primary (统一通貨), native currency as tooltip
     let mcapDisp = "—", mcapTip = "";
-    if (r.market_cap) {
-      mcapDisp = r.currency + fmtMcap(r.market_cap);
-      if (r.market_cap_usd) {
-        mcapTip = `≈ $${fmtMcap(r.market_cap_usd)} USD`;
+    if (r.market_cap_usd) {
+      mcapDisp = "$" + fmtMcap(r.market_cap_usd);
+      if (r.market_cap && r.currency !== "$") {
+        mcapTip = `${r.currency}${fmtMcap(r.market_cap)} (native)`;
       }
     }
     // Use edited state for sectors and note
@@ -1235,6 +1561,7 @@ function renderTable() {
       <td class="pct-soft ${cls(r.chg_5d)}">${sign(r.chg_5d)}${fmtNum(r.chg_5d,1)}%</td>
       <td class="pct-soft ${cls(r.chg_1mo)} chg1mo">${sign(r.chg_1mo)}${fmtNum(r.chg_1mo,1)}%</td>
       <td class="mcap" title="${mcapTip}">${mcapDisp}</td>
+      <td class="per">${r.pe_ratio != null ? fmtNum(r.pe_ratio, 1) : "—"}</td>
       <td>${fmtVol(r.volume)}</td>
       <td class="range-cell"><div class="range" style="--p:${(r.range_pos||50).toFixed(0)}%" title="${fmtNum(r.range_pos,0)}% of 52w range"></div></td>
       <td class="left sectors-cell">${sectorsHtml}</td>
@@ -1291,6 +1618,108 @@ function renderTable() {
         const newVal = input.value;
         if (newVal !== current) setNote(sym, newVal);
         cell.innerHTML = `<span class="note-display">${escapeHtml(newVal)}</span>`;
+      };
+      input.addEventListener("blur", commit);
+      input.addEventListener("keydown", (ke) => {
+        if (ke.key === "Enter") { ke.preventDefault(); input.blur(); }
+        if (ke.key === "Escape") { input.value = current; input.blur(); }
+      });
+    });
+  });
+
+  // Also render mobile cards (CSS controls which one is visible)
+  renderMobileCards(rs, topSym, botSym);
+}
+
+// Render mobile card layout
+function renderMobileCards(rs, topSym, botSym) {
+  const html = rs.map(r => {
+    const trCls = r.symbol === topSym ? " top-mover" : r.symbol === botSym ? " worst-mover" : "";
+    const sectors = getSectors(r.symbol);
+    const noteText = getNote(r.symbol);
+    const mcapUsd = r.market_cap_usd ? "$" + fmtMcap(r.market_cap_usd) : "—";
+    const sectorsHtml = `<div class="chips">
+      ${sectors.map(s => {
+        const active = s === sectorFilter ? " active" : "";
+        return `<span class="chip${active}" data-sector="${escapeHtml(s)}" data-sym-m="${r.symbol}">${escapeHtml(s)}<span class="chip-remove" data-remove-m="1" data-sym-m="${r.symbol}" data-s-m="${escapeHtml(s)}">×</span></span>`;
+      }).join("")}
+      <span class="add-chip" data-add-sym-m="${r.symbol}">+ add</span>
+    </div>`;
+    return `
+    <div class="mcard${trCls}" data-sym="${r.symbol}">
+      <div class="mcard-top">
+        <div>
+          <div class="mcard-name" title="${escapeHtml(r.name)}">${escapeHtml(r.name)}</div>
+          <div class="mcard-sym">${r.symbol}<span class="mcard-mkt">${r.market}</span></div>
+        </div>
+        <div class="mcard-pct">
+          <div class="pct-big ${cls(r.chg_pct)}">${sign(r.chg_pct)}${fmtNum(r.chg_pct,2)}%</div>
+          <div class="price">${fmtPrice(r.last, r.currency)}</div>
+        </div>
+      </div>
+      <div class="mcard-meta">
+        <div class="mc">
+          <div class="mc-label">5D</div>
+          <div class="mc-val ${cls(r.chg_5d)}">${sign(r.chg_5d)}${fmtNum(r.chg_5d,1)}%</div>
+        </div>
+        <div class="mc">
+          <div class="mc-label">1M</div>
+          <div class="mc-val ${cls(r.chg_1mo)}">${sign(r.chg_1mo)}${fmtNum(r.chg_1mo,1)}%</div>
+        </div>
+        <div class="mc">
+          <div class="mc-label">PER</div>
+          <div class="mc-val">${r.pe_ratio != null ? fmtNum(r.pe_ratio, 1) : "—"}</div>
+        </div>
+        <div class="mc">
+          <div class="mc-label">Mkt Cap</div>
+          <div class="mc-val">${mcapUsd}</div>
+        </div>
+      </div>
+      <div class="mcard-sectors">${sectorsHtml}</div>
+      <div class="mcard-note${noteText ? '' : ' empty'}" data-sym-note="${r.symbol}">${escapeHtml(noteText)}</div>
+    </div>`;
+  }).join("");
+  document.getElementById("mobileCards").innerHTML = html;
+
+  // Wire up sector chip click in mobile
+  document.querySelectorAll(".mcard .chip[data-sector]").forEach(chip => {
+    chip.addEventListener("click", (e) => {
+      if (e.target.closest(".chip-remove")) return;
+      const s = chip.dataset.sector;
+      sectorFilter = (sectorFilter === s) ? null : s;
+      renderSectorBar();
+      rerender();
+    });
+  });
+  document.querySelectorAll(".mcard .chip-remove").forEach(rm => {
+    rm.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const sym = rm.dataset.symM;
+      const s = rm.dataset.sM;
+      const current = getSectors(sym);
+      setSectors(sym, current.filter(x => x !== s));
+      rerender();
+    });
+  });
+  document.querySelectorAll(".mcard .add-chip").forEach(btn => {
+    btn.addEventListener("click", () => openSectorModal(btn.dataset.addSymM));
+  });
+  // Mobile note edit
+  document.querySelectorAll(".mcard-note").forEach(noteEl => {
+    noteEl.addEventListener("click", () => {
+      if (noteEl.querySelector("input")) return;
+      const sym = noteEl.dataset.symNote;
+      const current = getNote(sym);
+      noteEl.classList.remove("empty");
+      noteEl.innerHTML = `<input type="text" maxlength="200" value="${escapeHtml(current)}" placeholder="メモを入力...">`;
+      const input = noteEl.querySelector("input");
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+      const commit = () => {
+        const newVal = input.value;
+        if (newVal !== current) setNote(sym, newVal);
+        noteEl.classList.toggle("empty", !newVal);
+        noteEl.innerHTML = escapeHtml(newVal);
       };
       input.addEventListener("blur", commit);
       input.addEventListener("keydown", (ke) => {
