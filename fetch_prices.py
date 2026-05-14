@@ -44,13 +44,22 @@ def fetch_one(symbol: str) -> dict | None:
             base = float(closes.iloc[-1 - n])
             return ((last - base) / base) * 100 if base else None
 
-        # Market cap from fast_info (faster than .info)
+        # Market cap and PER from fast_info (faster than .info)
         market_cap = None
+        pe_ratio = None
         try:
             fi = tk.fast_info
             mc = fi.get("market_cap") or fi.get("marketCap")
             if mc:
                 market_cap = float(mc)
+        except Exception:
+            pass
+        # PER は fast_info にないことが多いため .info から取得（やや遅いが許容）
+        try:
+            info = tk.info
+            pe = info.get("trailingPE") or info.get("forwardPE")
+            if pe is not None and pe > 0 and pe < 10000:  # 異常値除外
+                pe_ratio = float(pe)
         except Exception:
             pass
 
@@ -68,6 +77,7 @@ def fetch_one(symbol: str) -> dict | None:
             "date": closes.index[-1].strftime("%Y-%m-%d"),
             "tick_time": int(closes.index[-1].timestamp()),
             "market_cap": market_cap,
+            "pe_ratio": pe_ratio,
         }
     except Exception as e:
         print(f"[WARN] {symbol}: {e}", file=sys.stderr)
@@ -969,8 +979,8 @@ TEMPLATE = r"""<!doctype html>
   }
   .mcard-meta {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 8px;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
     margin-bottom: 8px;
     padding: 8px 0;
     border-top: 1px solid var(--rule-soft);
@@ -1085,6 +1095,7 @@ TEMPLATE = r"""<!doctype html>
       <button class="qbtn" data-sort="chg_5d">5D %</button>
       <button class="qbtn" data-sort="chg_1mo">1M %</button>
       <button class="qbtn" data-sort="market_cap_usd">Mkt Cap ($)</button>
+      <button class="qbtn" data-sort="pe_ratio">PER</button>
       <button class="qbtn" data-sort="volume">Volume</button>
       <button class="qbtn" data-sort="symbol">Symbol</button>
     </div>
@@ -1318,6 +1329,7 @@ function renderTable() {
     { k: "chg_5d",  label: "5D %" },
     { k: "chg_1mo", label: "1M %",   extraClass: "col-1mo" },
     { k: "market_cap_usd", label: "Mkt Cap (USD)", extraClass: "col-mcap" },
+    { k: "pe_ratio", label: "PER", extraClass: "col-per" },
     { k: "volume",  label: "Volume", extraClass: "col-vol" },
     { k: "range_pos", label: "52W", extraClass: "col-range" },
     { k: "_sectors", label: "Sectors", left: true, extraClass: "col-sectors", sortable: false },
@@ -1376,6 +1388,7 @@ function renderTable() {
       <td class="pct-soft ${cls(r.chg_5d)}">${sign(r.chg_5d)}${fmtNum(r.chg_5d,1)}%</td>
       <td class="pct-soft ${cls(r.chg_1mo)} chg1mo">${sign(r.chg_1mo)}${fmtNum(r.chg_1mo,1)}%</td>
       <td class="mcap" title="${mcapTip}">${mcapDisp}</td>
+      <td class="per">${r.pe_ratio != null ? fmtNum(r.pe_ratio, 1) : "—"}</td>
       <td>${fmtVol(r.volume)}</td>
       <td class="range-cell"><div class="range" style="--p:${(r.range_pos||50).toFixed(0)}%" title="${fmtNum(r.range_pos,0)}% of 52w range"></div></td>
       <td class="left sectors-cell">${sectorsHtml}</td>
@@ -1479,6 +1492,10 @@ function renderMobileCards(rs, topSym, botSym) {
         <div class="mc">
           <div class="mc-label">1M</div>
           <div class="mc-val ${cls(r.chg_1mo)}">${sign(r.chg_1mo)}${fmtNum(r.chg_1mo,1)}%</div>
+        </div>
+        <div class="mc">
+          <div class="mc-label">PER</div>
+          <div class="mc-val">${r.pe_ratio != null ? fmtNum(r.pe_ratio, 1) : "—"}</div>
         </div>
         <div class="mc">
           <div class="mc-label">Mkt Cap</div>
