@@ -185,17 +185,27 @@ def main() -> int:
         return 1
 
     updated_at = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")
-    html = render_html(rows, updated_at)
+    html = render_html(rows, updated_at, fx)
     OUTPUT_FILE.write_text(html, encoding="utf-8")
     print(f"[OK] {len(rows)} 銘柄 / 出力: {OUTPUT_FILE}")
     return 0
 
 
-def render_html(rows: list[dict], updated_at: str) -> str:
+def render_html(rows: list[dict], updated_at: str, fx: dict[str, float] = None) -> str:
     """ダッシュボードHTMLを生成。データはJSONとして埋め込み、JSでテーブル描画。"""
     data_json = json.dumps(rows, ensure_ascii=False)
-    return TEMPLATE.replace("/*__DATA__*/", data_json).replace(
-        "__UPDATED__", updated_at
+    # Build FX rate display string for footer (1 USD = N XXX format)
+    fx_str = ""
+    if fx:
+        order = ["JPY", "KRW", "CNY", "HKD", "TWD"]
+        fmt = lambda v: f"{1/v:,.2f}" if v and v > 0 else "—"
+        parts = [f"1 USD = {fmt(fx.get(c))} {c}" for c in order if c in fx]
+        fx_str = " · ".join(parts)
+    return (
+        TEMPLATE
+        .replace("/*__DATA__*/", data_json)
+        .replace("__UPDATED__", updated_at)
+        .replace("__FX_RATES__", fx_str)
     )
 
 
@@ -896,22 +906,151 @@ TEMPLATE = r"""<!doctype html>
     letter-spacing: 0.04em;
   }
   footer a { color: var(--ink-soft); }
+  footer .fx-rates {
+    margin-top: 6px;
+    font-size: 10px;
+    color: var(--ink-faint);
+    opacity: 0.75;
+    letter-spacing: 0.02em;
+  }
+
+  /* Mobile card layout (replaces table on small screens) */
+  .mobile-cards { display: none; }
+  .mcard {
+    background: var(--bg-panel);
+    border: 1px solid var(--rule);
+    margin-bottom: 8px;
+    padding: 12px;
+  }
+  .mcard.top-mover { border-left: 3px solid var(--up); }
+  .mcard.worst-mover { border-left: 3px solid var(--down); }
+  .mcard-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .mcard-name {
+    font: 500 15px/1.3 "IBM Plex Sans", sans-serif;
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+  .mcard-sym {
+    font: 500 11px "IBM Plex Mono", monospace;
+    color: var(--accent);
+    margin-top: 2px;
+  }
+  .mcard-mkt {
+    font-size: 9px;
+    color: var(--ink-faint);
+    letter-spacing: 0.08em;
+    margin-left: 5px;
+  }
+  .mcard-pct {
+    text-align: right;
+    flex-shrink: 0;
+  }
+  .mcard-pct .pct-big {
+    font: 500 20px "IBM Plex Mono", monospace;
+    line-height: 1;
+  }
+  .mcard-pct .pct-big.up { color: var(--up); }
+  .mcard-pct .pct-big.down { color: var(--down); }
+  .mcard-pct .pct-big.flat { color: var(--flat); }
+  .mcard-pct .price {
+    font: 400 11px "IBM Plex Mono", monospace;
+    color: var(--ink-soft);
+    margin-top: 4px;
+  }
+  .mcard-meta {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-bottom: 8px;
+    padding: 8px 0;
+    border-top: 1px solid var(--rule-soft);
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .mcard-meta .mc {
+    text-align: center;
+  }
+  .mcard-meta .mc-label {
+    font: 500 9px "IBM Plex Mono", monospace;
+    color: var(--ink-faint);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 2px;
+  }
+  .mcard-meta .mc-val {
+    font: 500 12px "IBM Plex Mono", monospace;
+    color: var(--ink);
+  }
+  .mcard-meta .mc-val.up { color: var(--up); }
+  .mcard-meta .mc-val.down { color: var(--down); }
+  .mcard-sectors {
+    margin: 6px 0;
+  }
+  .mcard-note {
+    font: 400 12px/1.4 "IBM Plex Sans", sans-serif;
+    color: var(--ink-soft);
+    font-style: italic;
+    padding: 6px 0 0;
+    border-top: 1px dashed var(--rule-soft);
+    margin-top: 4px;
+    min-height: 22px;
+    cursor: pointer;
+  }
+  .mcard-note:empty::before, .mcard-note.empty::before {
+    content: "📝 メモを追加…";
+    color: var(--ink-faint);
+    font-style: normal;
+    font-size: 11px;
+  }
+  .mcard-note input {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    font: inherit;
+    color: var(--ink);
+    padding: 2px 0;
+    outline: 1px solid var(--accent);
+  }
 
   @media (max-width: 800px) {
-    .wrap { padding: 24px 16px 48px; }
+    .wrap { padding: 16px 12px 40px; }
     .summary { grid-template-columns: repeat(2, 1fr); }
-    .markets { grid-template-columns: repeat(3, 1fr); }
+    .markets { grid-template-columns: repeat(3, 1fr); gap: 0; }
+    .mkt-card { padding: 8px 10px; }
     .mkt-card:nth-child(3n) { border-right: 0; }
     .mkt-card:nth-child(n+4) { border-top: 1px solid var(--rule); }
+    .stat { padding: 10px 12px; }
     .stat:nth-child(2) { border-right: 0; }
     .stat:nth-child(1), .stat:nth-child(2) { border-bottom: 1px solid var(--rule); }
-    td.range-cell, th.col-range { display: none; }
-    td.chg1mo, th.col-1mo { display: none; }
-    td.col-vol, th.col-vol { display: none; }
-    td.col-mcap, th.col-mcap { display: none; }
-    td.note-cell, th.col-note { display: none; }
-    td.sectors-cell, th.col-sectors { max-width: 120px; }
-    .brand h1 { font-size: 24px; }
+    .brand h1 { font-size: 22px; }
+    .brand .sub { font-size: 12px; }
+    header { flex-direction: column; align-items: flex-start; gap: 8px; }
+    .meta { text-align: left; }
+    /* Hide desktop table, show mobile cards */
+    #tableMount table { display: none; }
+    .mobile-cards { display: block; }
+    /* Compact controls */
+    .controls { flex-direction: column; align-items: stretch; gap: 8px; }
+    .tabs { width: 100%; justify-content: space-between; }
+    .tab { padding: 8px 6px; flex: 1; text-align: center; font-size: 10px; }
+    .sort-bar { flex-wrap: wrap; }
+    .sort-bar .quick { width: 100%; overflow-x: auto; flex-wrap: nowrap; }
+    .sort-bar .qbtn { white-space: nowrap; flex-shrink: 0; }
+    .sort-bar > span:last-child { width: 100%; }
+    /* Save bar mobile */
+    .save-bar { left: 12px; right: 12px; bottom: 12px; }
+    .save-bar .msg { font-size: 12px; }
+    /* Modal full-width on mobile */
+    .modal { max-width: calc(100vw - 24px); }
   }
 </style>
 </head>
@@ -945,7 +1084,7 @@ TEMPLATE = r"""<!doctype html>
       <button class="qbtn" data-sort="chg_pct">Day %</button>
       <button class="qbtn" data-sort="chg_5d">5D %</button>
       <button class="qbtn" data-sort="chg_1mo">1M %</button>
-      <button class="qbtn" data-sort="market_cap_usd">Mkt Cap</button>
+      <button class="qbtn" data-sort="market_cap_usd">Mkt Cap ($)</button>
       <button class="qbtn" data-sort="volume">Volume</button>
       <button class="qbtn" data-sort="symbol">Symbol</button>
     </div>
@@ -955,10 +1094,12 @@ TEMPLATE = r"""<!doctype html>
   <div class="sector-bar" id="sectorBar"></div>
 
   <div id="tableMount"></div>
+  <div class="mobile-cards" id="mobileCards"></div>
 
   <footer>
-    Source: Yahoo Finance via yfinance. Prices may be delayed 15–20 minutes.
-    Auto-generated daily by GitHub Actions. For research only, not investment advice.
+    <div>Source: Yahoo Finance via yfinance. Prices may be delayed 15–20 minutes.
+    Auto-generated by GitHub Actions. For research only, not investment advice.</div>
+    <div class="fx-rates">FX (USD basis): __FX_RATES__</div>
   </footer>
 </div>
 
@@ -1176,7 +1317,7 @@ function renderTable() {
     { k: "chg_pct", label: "Day %" },
     { k: "chg_5d",  label: "5D %" },
     { k: "chg_1mo", label: "1M %",   extraClass: "col-1mo" },
-    { k: "market_cap_usd", label: "Mkt Cap", extraClass: "col-mcap" },
+    { k: "market_cap_usd", label: "Mkt Cap (USD)", extraClass: "col-mcap" },
     { k: "volume",  label: "Volume", extraClass: "col-vol" },
     { k: "range_pos", label: "52W", extraClass: "col-range" },
     { k: "_sectors", label: "Sectors", left: true, extraClass: "col-sectors", sortable: false },
@@ -1207,12 +1348,12 @@ function renderTable() {
     const tickLocal = tsAt(r.tick_time, MARKET_INFO[r.market]?.tz);
     const tickJst = tsAt(r.tick_time, "Asia/Tokyo");
     const tooltip = `Last tick: ${tickLocal} ${MARKET_INFO[r.market]?.label || ''} (${tickJst} JST)`;
-    // Market cap display: native currency primary, USD in tooltip
+    // Market cap display: USD primary (统一通貨), native currency as tooltip
     let mcapDisp = "—", mcapTip = "";
-    if (r.market_cap) {
-      mcapDisp = r.currency + fmtMcap(r.market_cap);
-      if (r.market_cap_usd) {
-        mcapTip = `≈ $${fmtMcap(r.market_cap_usd)} USD`;
+    if (r.market_cap_usd) {
+      mcapDisp = "$" + fmtMcap(r.market_cap_usd);
+      if (r.market_cap && r.currency !== "$") {
+        mcapTip = `${r.currency}${fmtMcap(r.market_cap)} (native)`;
       }
     }
     // Use edited state for sectors and note
@@ -1291,6 +1432,104 @@ function renderTable() {
         const newVal = input.value;
         if (newVal !== current) setNote(sym, newVal);
         cell.innerHTML = `<span class="note-display">${escapeHtml(newVal)}</span>`;
+      };
+      input.addEventListener("blur", commit);
+      input.addEventListener("keydown", (ke) => {
+        if (ke.key === "Enter") { ke.preventDefault(); input.blur(); }
+        if (ke.key === "Escape") { input.value = current; input.blur(); }
+      });
+    });
+  });
+
+  // Also render mobile cards (CSS controls which one is visible)
+  renderMobileCards(rs, topSym, botSym);
+}
+
+// Render mobile card layout
+function renderMobileCards(rs, topSym, botSym) {
+  const html = rs.map(r => {
+    const trCls = r.symbol === topSym ? " top-mover" : r.symbol === botSym ? " worst-mover" : "";
+    const sectors = getSectors(r.symbol);
+    const noteText = getNote(r.symbol);
+    const mcapUsd = r.market_cap_usd ? "$" + fmtMcap(r.market_cap_usd) : "—";
+    const sectorsHtml = `<div class="chips">
+      ${sectors.map(s => {
+        const active = s === sectorFilter ? " active" : "";
+        return `<span class="chip${active}" data-sector="${escapeHtml(s)}" data-sym-m="${r.symbol}">${escapeHtml(s)}<span class="chip-remove" data-remove-m="1" data-sym-m="${r.symbol}" data-s-m="${escapeHtml(s)}">×</span></span>`;
+      }).join("")}
+      <span class="add-chip" data-add-sym-m="${r.symbol}">+ add</span>
+    </div>`;
+    return `
+    <div class="mcard${trCls}" data-sym="${r.symbol}">
+      <div class="mcard-top">
+        <div>
+          <div class="mcard-name" title="${escapeHtml(r.name)}">${escapeHtml(r.name)}</div>
+          <div class="mcard-sym">${r.symbol}<span class="mcard-mkt">${r.market}</span></div>
+        </div>
+        <div class="mcard-pct">
+          <div class="pct-big ${cls(r.chg_pct)}">${sign(r.chg_pct)}${fmtNum(r.chg_pct,2)}%</div>
+          <div class="price">${fmtPrice(r.last, r.currency)}</div>
+        </div>
+      </div>
+      <div class="mcard-meta">
+        <div class="mc">
+          <div class="mc-label">5D</div>
+          <div class="mc-val ${cls(r.chg_5d)}">${sign(r.chg_5d)}${fmtNum(r.chg_5d,1)}%</div>
+        </div>
+        <div class="mc">
+          <div class="mc-label">1M</div>
+          <div class="mc-val ${cls(r.chg_1mo)}">${sign(r.chg_1mo)}${fmtNum(r.chg_1mo,1)}%</div>
+        </div>
+        <div class="mc">
+          <div class="mc-label">Mkt Cap</div>
+          <div class="mc-val">${mcapUsd}</div>
+        </div>
+      </div>
+      <div class="mcard-sectors">${sectorsHtml}</div>
+      <div class="mcard-note${noteText ? '' : ' empty'}" data-sym-note="${r.symbol}">${escapeHtml(noteText)}</div>
+    </div>`;
+  }).join("");
+  document.getElementById("mobileCards").innerHTML = html;
+
+  // Wire up sector chip click in mobile
+  document.querySelectorAll(".mcard .chip[data-sector]").forEach(chip => {
+    chip.addEventListener("click", (e) => {
+      if (e.target.closest(".chip-remove")) return;
+      const s = chip.dataset.sector;
+      sectorFilter = (sectorFilter === s) ? null : s;
+      renderSectorBar();
+      rerender();
+    });
+  });
+  document.querySelectorAll(".mcard .chip-remove").forEach(rm => {
+    rm.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const sym = rm.dataset.symM;
+      const s = rm.dataset.sM;
+      const current = getSectors(sym);
+      setSectors(sym, current.filter(x => x !== s));
+      rerender();
+    });
+  });
+  document.querySelectorAll(".mcard .add-chip").forEach(btn => {
+    btn.addEventListener("click", () => openSectorModal(btn.dataset.addSymM));
+  });
+  // Mobile note edit
+  document.querySelectorAll(".mcard-note").forEach(noteEl => {
+    noteEl.addEventListener("click", () => {
+      if (noteEl.querySelector("input")) return;
+      const sym = noteEl.dataset.symNote;
+      const current = getNote(sym);
+      noteEl.classList.remove("empty");
+      noteEl.innerHTML = `<input type="text" maxlength="200" value="${escapeHtml(current)}" placeholder="メモを入力...">`;
+      const input = noteEl.querySelector("input");
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+      const commit = () => {
+        const newVal = input.value;
+        if (newVal !== current) setNote(sym, newVal);
+        noteEl.classList.toggle("empty", !newVal);
+        noteEl.innerHTML = escapeHtml(newVal);
       };
       input.addEventListener("blur", commit);
       input.addEventListener("keydown", (ke) => {
